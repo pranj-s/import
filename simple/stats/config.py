@@ -197,6 +197,13 @@ class Config:
     return self._per_file_config(input_file).get(_PROVENANCE_FIELD,
                                                  input_file.path)
 
+  def provenance(self, input_file: File) -> str | None:
+    """Returns the provenance configured for a file, or None if not set.
+
+    Unlike provenance_name(), this does not fall back to the file path.
+    """
+    return self._per_file_config(input_file).get(_PROVENANCE_FIELD) or None
+
   def row_entity_type(self, input_file: File) -> str:
     return self._per_file_config(input_file).get(_ROW_ENTITY_TYPE_FIELD, "")
 

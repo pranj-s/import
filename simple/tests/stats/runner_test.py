@@ -560,6 +560,43 @@ class TestRunner(unittest.TestCase):
       self.assertEqual(report["run"]["outputPath"],
                        "gs://my-bucket/jsonld/run_timestamp")
       self.assertEqual(report["errors"], [])
+      self.assertEqual(report["folders"], [{
+          "folderName":
+              "ilo",
+          "summary": {
+              "files": {
+                  "count": 2,
+                  "byType": {
+                      "csv": 1,
+                      "mcf": 1
+                  }
+              },
+              "provenanceCount": 1,
+          },
+          "provenances": [{
+              "id": "dcid:ilo",
+              "sourceId": "dcid:IloSource",
+              "fileCount": 2
+          }],
+      }, {
+          "folderName":
+              "oecd",
+          "summary": {
+              "files": {
+                  "count": 2,
+                  "byType": {
+                      "csv": 1,
+                      "mcf": 1
+                  }
+              },
+              "provenanceCount": 1,
+          },
+          "provenances": [{
+              "id": "dcid:oecd",
+              "sourceId": "dcid:OecdSource",
+              "fileCount": 2
+          }],
+      }])
 
   @mock.patch.dict(
       os.environ, {
@@ -651,14 +688,36 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(err["problemColumns"], ["unmapped_metadata"])
         self.assertIn("contains unmapped columns", err["errorMessage"])
 
-        # The ingestion report is still written, with the same errors as the
-        # handshake.
+        # The ingestion report is still written, with the files found before
+        # the failure and the same errors as the handshake.
         report = _read_ingestion_report(temp_dir)
         self.assertEqual(report["run"]["status"], "FAILURE")
         self.assertEqual(report["run"]["workflowExecutionId"],
                          "test_wf_id_fail")
         self.assertEqual(report["run"]["folderNames"], ["input_fail"])
         self.assertEqual(report["errors"], written_payload["errors"])
+        self.assertEqual(
+            report["folders"],
+            [{
+                "folderName":
+                    "input_fail",
+                "summary": {
+                    "files": {
+                        "count": 2,
+                        "byType": {
+                            "csv": 1,
+                            "mcf": 1
+                        }
+                    },
+                    "provenanceCount": 1,
+                },
+                # MCF files aren't imported yet, so the source isn't known.
+                "provenances": [{
+                    "id": "dcid:provenance/FailTest",
+                    "sourceId": None,
+                    "fileCount": 1
+                }],
+            }])
 
   def test_ingestion_report_write_failure_does_not_fail_run(self):
     with tempfile.TemporaryDirectory() as temp_dir:

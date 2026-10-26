@@ -28,6 +28,7 @@ from stats import constants
 from stats.config import Config
 from stats.data import FileValidationError
 from stats.data import ImportType
+from stats.data import strip_namespace
 from stats.data import Triple
 from stats.data import ValidationErrorType
 from stats.entities_importer import EntitiesImporter
@@ -44,6 +45,7 @@ from stats.nodes import Nodes
 from stats.reporter import FileImportReporter
 from stats.reporter import ImportReporter
 import stats.schema_constants as sc
+from stats.util import is_uri_or_namespace
 from stats.validation import MetadataValidator
 from stats.variable_per_row_importer import VariablePerRowImporter
 from util.file_match import match
@@ -456,6 +458,7 @@ class Runner:
           status=status,
           output_path=self.graph_writer.jsonld_dir.full_path(),
           workflow_execution_id=os.getenv("WORKFLOW_EXECUTION_ID"),
+          source_id_for=self._source_id_for,
           errors=errors)
       report_file = self.graph_writer.jsonld_dir.open_file(
           constants.INGESTION_REPORT_FILE_NAME)
@@ -463,6 +466,36 @@ class Runner:
       logging.info("Wrote ingestion report to %s", report_file.full_path())
     except Exception:
       logging.exception("Failed to write the ingestion report.")
+
+  def _source_id_for(self, provenance: str) -> Optional[str]:
+    """Returns the source ID of a provenance, as a namespaced DCID if known."""
+    prov = (self.nodes.provenances.get(provenance) or
+            self.nodes.provenances.get(strip_namespace(provenance)))
+    if not prov or not prov.source_id:
+      return None
+    if is_uri_or_namespace(prov.source_id):
+      return prov.source_id
+    return f"dcid:{prov.source_id}"
+
+  def _record_input_files(self, files: list[File]) -> None:
+    """Adds the files that will be imported to the ingestion summary."""
+    if not self.summary:
+      return
+    try:
+      for file in files:
+        file_type = fspath.splitext(file.name())[1].lstrip(".").lower()
+        self.summary.record_input_file(folder_name=self._folder_name(file),
+                                       file_type=file_type,
+                                       provenance=self.config.provenance(file))
+    except Exception:
+      logging.exception(
+          "Failed to record input files for the ingestion report.")
+
+  def _folder_name(self, file: File) -> str:
+    """Returns the import folder an input file belongs to."""
+    if self.active_import_prefixes is None:
+      return self._single_folder_name
+    return _top_level_folder(file.path)
 
   def _read_config_from_file(self,
                              config_file_path: str,
@@ -709,6 +742,9 @@ class Runner:
     logging.info("Found %d MCF files to import", len(mcf_files))
     logging.info("Matched files to process: %s",
                  [f.full_path() for f in csv_files + mcf_files])
+
+    # Record files before header validation so failed runs still report them.
+    self._record_input_files(csv_files + mcf_files)
 
     # Validate all CSV headers upfront
     self._validate_all_headers(csv_files)
