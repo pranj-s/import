@@ -42,6 +42,16 @@ def _sort_key(graph_entry: dict) -> str:
   return json.dumps(graph_entry, sort_keys=True)
 
 
+def _read_ingestion_report(output_dir: str) -> dict:
+  """Returns the one ingestion_report.json written under output_dir/jsonld."""
+  paths = list(
+      Path(output_dir).glob(f"jsonld/*/{constants.INGESTION_REPORT_FILE_NAME}"))
+  if len(paths) != 1:
+    raise AssertionError(f"Expected one ingestion report, found: {paths}")
+  with open(paths[0], "r") as f:
+    return json.load(f)
+
+
 @freeze_time("2025-01-23")
 def _test_runner(test: unittest.TestCase,
                  test_name: str,
@@ -80,7 +90,10 @@ def _test_runner(test: unittest.TestCase,
     if is_write_mode():
       if os.path.exists(output_jsonld_dir):
         shutil.rmtree(expected_jsonld_dir, ignore_errors=True)
-        shutil.copytree(output_jsonld_dir, expected_jsonld_dir)
+        shutil.copytree(output_jsonld_dir,
+                        expected_jsonld_dir,
+                        ignore=shutil.ignore_patterns(
+                            constants.INGESTION_REPORT_FILE_NAME))
       return
 
     def load_jsonld(dir_path):
@@ -89,6 +102,8 @@ def _test_runner(test: unittest.TestCase,
       observations = []
       for root, _, files in os.walk(dir_path):
         for file_name in files:
+          if not file_name.endswith(".jsonld"):
+            continue
           with open(os.path.join(root, file_name), "r") as f:
             graph = json.load(f)["@graph"]
           target = nodes if file_name.startswith("node-") else observations
@@ -285,8 +300,13 @@ class TestRunner(unittest.TestCase):
       timestamped_dir = os.path.join(jsonld_dir, subdirs[0])
       self.assertTrue(os.path.isdir(timestamped_dir))
 
-      # Ensure the timestamped directory has import subfolders
-      import_dirs = os.listdir(timestamped_dir)
+      # Ensure the timestamped directory has import subfolders, plus the
+      # ingestion report at its root.
+      entries = os.listdir(timestamped_dir)
+      self.assertIn(constants.INGESTION_REPORT_FILE_NAME, entries)
+      import_dirs = [
+          d for d in entries if d != constants.INGESTION_REPORT_FILE_NAME
+      ]
       self.assertGreater(len(import_dirs), 0)
       import_dir_path = os.path.join(timestamped_dir, import_dirs[0])
       self.assertTrue(os.path.isdir(import_dir_path))
@@ -531,6 +551,16 @@ class TestRunner(unittest.TestCase):
       trigger_names = sorted([t["importName"] for t in decoded_import_list])
       self.assertEqual(trigger_names, ["ilo", "oecd"])
 
+      # Verify the ingestion report: one entry per import folder.
+      report = _read_ingestion_report(output_dir)
+      self.assertEqual(report["run"]["workflowExecutionId"], "my-execution")
+      self.assertEqual(report["run"]["mode"], "INGEST")
+      self.assertEqual(report["run"]["status"], "SUCCESS")
+      self.assertEqual(report["run"]["folderNames"], ["ilo", "oecd"])
+      self.assertEqual(report["run"]["outputPath"],
+                       "gs://my-bucket/jsonld/run_timestamp")
+      self.assertEqual(report["errors"], [])
+
   @mock.patch.dict(
       os.environ, {
           "WORKFLOW_EXECUTION_ID": "test_wf_id_fail",
@@ -620,6 +650,52 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(err["errorType"], ValidationErrorType.UNMAPPED_COLUMNS)
         self.assertEqual(err["problemColumns"], ["unmapped_metadata"])
         self.assertIn("contains unmapped columns", err["errorMessage"])
+
+        # The ingestion report is still written, with the same errors as the
+        # handshake.
+        report = _read_ingestion_report(temp_dir)
+        self.assertEqual(report["run"]["status"], "FAILURE")
+        self.assertEqual(report["run"]["workflowExecutionId"],
+                         "test_wf_id_fail")
+        self.assertEqual(report["run"]["folderNames"], ["input_fail"])
+        self.assertEqual(report["errors"], written_payload["errors"])
+
+  def test_ingestion_report_write_failure_does_not_fail_run(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      input_dir = os.path.join(temp_dir, "input")
+      os.makedirs(input_dir)
+      with open(os.path.join(input_dir, "data.csv"), "w") as f:
+        f.write("entity,date,variable,value\ncountry/USA,2020,Count_Frog,5\n")
+      with open(os.path.join(input_dir, "provenance.mcf"), "w") as f:
+        f.write("Node: dcid:FrogSource\ntypeOf: dcs:Source\n\n"
+                "Node: dcid:FrogProv\ntypeOf: dcs:Provenance\n"
+                "source: dcid:FrogSource\n")
+      with open(os.path.join(input_dir, "config.json"), "w") as f:
+        json.dump(
+            {
+                "inputFiles": [{
+                    "pattern": "data.csv",
+                    "provenance": "dcid:FrogProv",
+                    "columnMappings": {
+                        "dcid:variableMeasured": "variable",
+                        "dcid:observationAbout": "entity",
+                        "dcid:observationDate": "date",
+                        "dcid:value": "value"
+                    }
+                }, {
+                    "pattern": "*.mcf",
+                    "provenance": "dcid:FrogProv"
+                }]
+            }, f)
+      dc_client.get_property_of_entities = mock.MagicMock(return_value={})
+
+      runner = Runner(config_file_path=None,
+                      input_dir_path=input_dir,
+                      output_dir_path=os.path.join(temp_dir, "output"),
+                      use_multiprocessing=False)
+      with mock.patch("stats.runner.IngestionSummary.to_json",
+                      side_effect=RuntimeError("boom")):
+        runner.run()  # Must not raise.
 
 
 class TestMain(unittest.TestCase):

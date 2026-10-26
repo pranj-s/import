@@ -35,6 +35,9 @@ from stats.events_importer import EventsImporter
 from stats.graph_writer import GraphWriter
 from stats.importer import EntityResolutionError
 from stats.importer import Importer
+from stats.ingestion_summary import IngestionSummary
+from stats.ingestion_summary import STATUS_FAILURE
+from stats.ingestion_summary import STATUS_SUCCESS
 from stats.jsonld_stream_writer import JsonLdStreamWriter
 from stats.mcf_importer import McfImporter
 from stats.nodes import Nodes
@@ -212,6 +215,13 @@ class Runner:
     self.import_names = import_names
     self.use_multiprocessing = use_multiprocessing
     self.active_import_prefixes = None
+    # Import folders reported in ingestion_report.json. For single-folder runs
+    # (one import, config at the input root, or config file driven), every
+    # file belongs to _single_folder_name. For multi-folder runs, a file's
+    # folder is the first segment of its path under the input dir.
+    self._folder_names: list[str] = []
+    self._single_folder_name: Optional[str] = None
+    self.summary: Optional[IngestionSummary] = None
 
     # File systems, both input and output. Must be closed when run finishes.
     self.all_stores: list[Store] = []
@@ -250,6 +260,8 @@ class Runner:
         configs = self._read_configs_from_subdirs(input_store.as_dir())
         self.active_import_prefixes = set(
             f"{fspath.dirname(c.path)}/" for c in configs)
+        self._folder_names = sorted(
+            set(_top_level_folder(c.path) for c in configs))
 
       # Case B: Combined Load for specific imports (len > 1)
       elif len(imports) > 1:
@@ -260,6 +272,7 @@ class Runner:
         configs = self._read_configs_from_list(input_store.as_dir(), imports)
         self.active_import_prefixes = set(
             f"{fspath.dirname(c.path)}/" for c in configs)
+        self._folder_names = [name.strip() for name in imports]
 
       # Case C: Single Import
       elif imports:
@@ -272,6 +285,7 @@ class Runner:
             config_file_path=constants.CONFIG_JSON_FILE_NAME,
             config_file_dir=input_store.as_dir(),
         )
+        self._single_folder_name = imports[0].strip()
 
       # Case D: Default action (config at root)
       else:
@@ -282,6 +296,16 @@ class Runner:
             config_file_path=constants.CONFIG_JSON_FILE_NAME,
             config_file_dir=input_store.as_dir(),
         )
+        self._single_folder_name = (self.config.data.get("importName") or
+                                    fspath.basename(
+                                        fspath.normpath(effective_input_dir)))
+
+    # Config file driven runs have no input folder; use the config's import name.
+    if self.active_import_prefixes is None and not self._single_folder_name:
+      self._single_folder_name = (self.config.data.get("importName") or
+                                  "default_import_name")
+    if self.active_import_prefixes is None:
+      self._folder_names = [self._single_folder_name]
 
     # Special file handlers and flags
     if import_proxy_entities is not None:
@@ -312,6 +336,7 @@ class Runner:
     self.trigger_workflow_info = None
 
   def run(self):
+    self.summary = IngestionSummary(self._folder_names)
     try:
       self._run_imports_and_export_jsonld()
 
@@ -319,6 +344,7 @@ class Runner:
 
       # Report done.
       self.reporter.report_done()
+      self._write_ingestion_report(STATUS_SUCCESS)
 
       # Close all file storage.
       for store in self.all_stores:
@@ -348,6 +374,8 @@ class Runner:
                                   error_type=ValidationErrorType.GENERIC_ERROR,
                                   error_message=str(e))
           ]
+
+      self._write_ingestion_report(STATUS_FAILURE)
 
       for store in self.all_stores:
         try:
@@ -407,6 +435,34 @@ class Runner:
           output_json_path)
     else:
       logging.info("Successfully wrote preprocessor result to GCS.")
+
+  def _write_ingestion_report(self, status: str) -> None:
+    """Writes ingestion_report.json next to this run's JSON-LD output.
+
+    Never raises. The report is informational, so a problem writing it must
+    not fail a good run or hide the error that failed a bad one.
+    """
+    if not self.summary or not self.graph_writer:
+      logging.warning(
+          "Skipping ingestion report: the run failed before JSON-LD output "
+          "was set up.")
+      return
+    try:
+      errors = [
+          err.to_dict() if hasattr(err, "to_dict") else err
+          for err in getattr(self, "_failure_errors", [])
+      ]
+      report = self.summary.to_json(
+          status=status,
+          output_path=self.graph_writer.jsonld_dir.full_path(),
+          workflow_execution_id=os.getenv("WORKFLOW_EXECUTION_ID"),
+          errors=errors)
+      report_file = self.graph_writer.jsonld_dir.open_file(
+          constants.INGESTION_REPORT_FILE_NAME)
+      report_file.write(json.dumps(report, indent=2))
+      logging.info("Wrote ingestion report to %s", report_file.full_path())
+    except Exception:
+      logging.exception("Failed to write the ingestion report.")
 
   def _read_config_from_file(self,
                              config_file_path: str,
@@ -820,6 +876,11 @@ class Runner:
       logging.info(
           "Not running under ingestion workflow or output is local. Skipping handshake info."
       )
+
+
+def _top_level_folder(path: str) -> str:
+  """Returns the first segment of a path relative to the input dir."""
+  return fspath.relpath(path).split("/", 1)[0]
 
 
 def _check_not_overlapping(input_store: Store, output_store: Store):
